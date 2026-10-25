@@ -1,0 +1,209 @@
+# The bootstrap gate for heyintern/cloud: the only workflow its bootstrap roles trust
+# (job_workflow_ref colegottdank/heyintern-gate/.github/workflows/bootstrap.yml@refs/heads/main,
+# heyintern/cloud's infra/bootstrap/bootstrap_ci.tf). Only this repository's owner can change it;
+# heyintern/cloud's .github/workflows/bootstrap.yml calls it, with no inputs that change what it does.
+#   pull request: plan with the read-only bootstrap plan role, show it, keep its record.
+#   heyintern/cloud main, push or a manual run, by the owner: apply the merged pull requests (gate.py).
+# It runs only its own code (gate.py, from the commit this file came from) and heyintern/cloud's
+# OpenTofu stack; nothing else from heyintern/cloud ever runs with a role. Every check on who and what
+# is in gate.py and in the conditions below; the AWS trust checks the owner again.
+name: bootstrap gate
+
+on:
+  workflow_call:
+    inputs:
+      state_bucket:
+        description: "heyintern/cloud's state bucket, heyintern-tfstate-<account id>; the role ARNs follow from it (fixed names)"
+        type: string
+        required: true
+    secrets:
+      BUDGET_EMAIL:
+        description: The budget email (heyintern/cloud's BUDGET_EMAIL secret)
+        required: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TOFU_VERSION: 1.13.2
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  OWNER_ID: "18726574"   # colegottdank, heyintern/cloud's infra/bootstrap/github-oidc.json bootstrap_actors
+  GATE: colegottdank/heyintern-gate
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request' && github.repository == 'heyintern/cloud'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: The account, from the state bucket's name
+        id: acct
+        env:
+          BUCKET: ${{ inputs.state_bucket }}
+        run: |
+          [[ $BUCKET =~ ^heyintern-tfstate-([0-9]{12})$ ]] || { echo "::error::state_bucket must be heyintern-tfstate-<account id>"; exit 1; }
+          echo "account=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+      - name: heyintern/cloud (the pull request's merge ref)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: cloud
+          persist-credentials: false
+          fetch-depth: 0
+      - name: This gate (its main; checked against the workflow's own commit next)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GATE }}
+          ref: main
+          path: gate
+          persist-credentials: false
+      - name: The gate code is the commit this workflow came from (OIDC job_workflow_sha; no AWS)
+        run: python3 -I gate/gate.py self --dir gate
+      - name: Gate unit tests (no AWS)
+        run: python3 -I -B -m unittest discover -s gate -p test_gate.py
+      - name: The caller, and the OIDC subject the plan role trusts
+        run: python3 -I gate/gate.py oidc --kind plan --config cloud/infra/bootstrap/github-oidc.json
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+          checksums: |
+            723bebb0df8411daff1e5fc3862e28ff5581fe5634087f4c29a9aa41d78208b5
+            ac05d9952662c7db28dd57e93f0a68018837bfdf9342384ec0987977c16a9645
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.acct.outputs.account }}:role/heyintern-ci/heyintern-ci-bootstrap-plan
+          aws-region: ${{ env.AWS_REGION }}
+      - name: tofu plan (bootstrap)
+        env:
+          STATE_BUCKET: ${{ inputs.state_bucket }}
+          TF_VAR_budget_email: ${{ secrets.BUDGET_EMAIL }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          [ -n "$TF_VAR_budget_email" ] || { echo "::error::Set heyintern/cloud's BUDGET_EMAIL secret"; exit 1; }
+          tofu -chdir=cloud/infra/bootstrap init -lockfile=readonly -backend-config="bucket=$STATE_BUCKET"
+          # No lock: the plan role cannot write, so it never holds or breaks an apply's lock.
+          tofu -chdir=cloud/infra/bootstrap plan -lock=false -no-color -out=bootstrap.tfplan | tee plan.txt
+          # The JSON holds the budget email: it stays on this runner and only its digest leaves.
+          tofu -chdir=cloud/infra/bootstrap show -json bootstrap.tfplan > plan.json
+          python3 -I gate/gate.py record --repo cloud --plan-json plan.json --pr "$PR" --head-sha "$HEAD_SHA" --out gate.json
+          rm plan.json
+          aws s3 cp "s3://$STATE_BUCKET/bootstrap/applied.json" applied.json --only-show-errors 2> /dev/null || rm -f applied.json
+          python3 -I gate/gate.py unapplied --repo cloud --applied applied.json > unapplied.md
+          {
+            echo '### tofu plan (bootstrap)'
+            echo 'Made by the bootstrap gate (colegottdank/heyintern-gate). The owner merging this pull request applies it, only if main still matches it then.'
+            echo
+            cat unapplied.md
+            echo
+            echo '```'; tail -c 60000 plan.txt; echo '```'
+            echo
+            echo "Record: $(jq -r '"\(.changes | length) resources change, digest \(.digest[0:16])"' gate.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the plan's record (no values) for the apply
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bootstrap-plan
+          path: gate.json
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+
+  apply:
+    if: >-
+      github.event_name != 'pull_request' && github.repository == 'heyintern/cloud' && github.ref == 'refs/heads/main'
+      && github.workflow_ref == 'heyintern/cloud/.github/workflows/bootstrap.yml@refs/heads/main'
+      && github.actor_id == '18726574' && github.triggering_actor == github.actor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: bootstrap-apply
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      actions: read         # the pull request's plan record
+      pull-requests: read   # which pull requests these are
+    steps:
+      - name: The account, from the state bucket's name
+        id: acct
+        env:
+          BUCKET: ${{ inputs.state_bucket }}
+        run: |
+          [[ $BUCKET =~ ^heyintern-tfstate-([0-9]{12})$ ]] || { echo "::error::state_bucket must be heyintern-tfstate-<account id>"; exit 1; }
+          echo "account=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+      - name: heyintern/cloud (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: cloud
+          persist-credentials: false
+          fetch-depth: 0
+      - name: This gate (its main; checked against the workflow's own commit next)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GATE }}
+          ref: main
+          path: gate
+          persist-credentials: false
+      - name: The gate code is the commit this workflow came from (OIDC job_workflow_sha; no AWS)
+        run: python3 -I gate/gate.py self --dir gate
+      - name: Gate unit tests (no AWS)
+        run: python3 -I -B -m unittest discover -s gate -p test_gate.py
+      - name: The owner, the merged pull requests, and their plan on exactly this code (no AWS yet)
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PRS: ${{ github.event.inputs.prs }}
+        run: python3 -I gate/gate.py find --repo cloud --event "$EVENT" --prs "$PRS" --owner-id "$OWNER_ID" --dir "$RUNNER_TEMP/bootstrap-plan"
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+          checksums: |
+            723bebb0df8411daff1e5fc3862e28ff5581fe5634087f4c29a9aa41d78208b5
+            ac05d9952662c7db28dd57e93f0a68018837bfdf9342384ec0987977c16a9645
+      - name: tofu test (mocked AWS, before any credentials)
+        run: |
+          tofu -chdir=cloud/infra/bootstrap init -backend=false -lockfile=readonly
+          tofu -chdir=cloud/infra/bootstrap test
+      - name: The OIDC subject the bootstrap role trusts
+        run: python3 -I gate/gate.py oidc --kind apply --config cloud/infra/bootstrap/github-oidc.json
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.acct.outputs.account }}:role/heyintern-ci/heyintern-ci-bootstrap
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Nothing else since the last apply, then the same plan as the pull request's, then apply it
+        env:
+          STATE_BUCKET: ${{ inputs.state_bucket }}
+          TF_VAR_budget_email: ${{ secrets.BUDGET_EMAIL }}
+          RECORD: ${{ steps.gate.outputs.record }}
+          ALLOWED: ${{ steps.gate.outputs.allowed }}
+        run: |
+          [ -n "$TF_VAR_budget_email" ] || { echo "::error::Set heyintern/cloud's BUDGET_EMAIL secret"; exit 1; }
+          aws s3 cp "s3://$STATE_BUCKET/bootstrap/applied.json" applied.json --only-show-errors 2> /dev/null || rm -f applied.json
+          python3 -I gate/gate.py history --repo cloud --applied applied.json --allowed "$ALLOWED"
+          tofu -chdir=cloud/infra/bootstrap init -reconfigure -lockfile=readonly -backend-config="bucket=$STATE_BUCKET"
+          tofu -chdir=cloud/infra/bootstrap plan -lock-timeout=5m -no-color -out=bootstrap.tfplan | tee plan.txt
+          tofu -chdir=cloud/infra/bootstrap show -json bootstrap.tfplan > plan.json
+          python3 -I gate/gate.py compare --expected "$RECORD" --plan-json plan.json || { rm plan.json; exit 1; }
+          rm plan.json
+          tofu -chdir=cloud/infra/bootstrap apply -lock-timeout=5m -no-color bootstrap.tfplan
+      - name: Record what is applied (the next plans and applies start from here)
+        env:
+          STATE_BUCKET: ${{ inputs.state_bucket }}
+          PRS: ${{ steps.gate.outputs.prs }}
+          PLAN_RUN: ${{ steps.gate.outputs.plan_run }}
+        run: |
+          jq -n --arg commit "$GITHUB_SHA" --arg prs "$PRS" --arg plan_run "$PLAN_RUN" --arg run "$GITHUB_RUN_ID" --arg at "$(date -u +%FT%TZ)" \
+            '{commit: $commit, prs: ($prs | split(",") | map(tonumber)), plan_run: ($plan_run | tonumber), apply_run: ($run | tonumber), at: $at}' > applied.json
+          aws s3api put-object --bucket "$STATE_BUCKET" --key bootstrap/applied.json --body applied.json --content-type application/json > /dev/null
+          { echo "### Applied #$PRS (plan run $PLAN_RUN) at ${GITHUB_SHA:0:12}"; echo '```'; tail -c 60000 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

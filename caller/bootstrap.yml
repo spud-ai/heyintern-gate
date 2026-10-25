@@ -1,0 +1,72 @@
+# heyintern/cloud's bootstrap workflow, once colegottdank/heyintern-gate exists (docs/setup.md,
+# step 15): copy this file over .github/workflows/bootstrap.yml in a pull request.
+#
+# It only calls the bootstrap gate, the one workflow the bootstrap roles trust. Nothing here runs
+# with AWS credentials, and nothing here can change what the gate does: the gate checks who started
+# the run, which pull requests are merged, that nothing else reached main since the last apply, and
+# that the plan matches the one the pull request showed.
+#   pull request: the gate plans and shows it in the run summary.
+#   push to main (the owner's merge) or Run workflow (the owner, naming merged pull requests): the
+#     gate applies. Anyone else's merge or push: a notice, nothing reaches AWS.
+name: bootstrap
+
+on:
+  pull_request:
+    paths: [infra/bootstrap/**, .github/workflows/bootstrap.yml]
+  push:
+    branches: [main]
+    paths: [infra/bootstrap/**, .github/workflows/bootstrap.yml]
+  workflow_dispatch:
+    inputs:
+      prs:
+        description: "The merged pull requests to apply, comma-separated. Every bootstrap change on main since the last apply must belong to one of them."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No email in committed tfvars (the budget email is the BUDGET_EMAIL secret)
+        run: |
+          if git ls-files -z -- '*.tfvars' '*.tfvars.json' | xargs -0 -r grep -nE '[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+'; then
+            echo "::error::A committed tfvars file holds an email address: the budget email goes in the BUDGET_EMAIL secret, never in Git."
+            exit 1
+          fi
+
+  not-the-owner:
+    if: >-
+      github.event_name != 'pull_request'
+      && (github.ref != 'refs/heads/main' || github.actor_id != '18726574' || github.triggering_actor != github.actor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Not applied
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING: ${{ github.triggering_actor }}
+        run: |
+          msg="Not applied: the bootstrap is applied only by the owner's merge or Run workflow, on main (actor $ACTOR, started by $TRIGGERING, ref $GITHUB_REF). Nothing reached AWS."
+          echo "::notice::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    needs: check
+    if: vars.TF_STATE_BUCKET != ''
+    uses: colegottdank/heyintern-gate/.github/workflows/bootstrap.yml@main
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+      pull-requests: read
+    with:
+      state_bucket: ${{ vars.TF_STATE_BUCKET }}
+    secrets:
+      BUDGET_EMAIL: ${{ secrets.BUDGET_EMAIL }}
